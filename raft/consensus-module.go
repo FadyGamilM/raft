@@ -1,6 +1,9 @@
 package raft
 
 import (
+	"log"
+	"math/rand"
+	"slices"
 	"sync"
 	"time"
 )
@@ -29,8 +32,18 @@ type RaftConsensusModule struct {
 	LastAppliedLogIndex int
 
 	// =====> statses persisted on volatile storage for leader node only [reInitilized after election]
-	ElectionTimeout  time.Time
-	HeartbeatTimeout time.Time
+	ElectionTimeout                     time.Time
+	HeartbeatTimeout                    time.Time
+	TimeSinceNodeStartedElectionTimeOut time.Time
+}
+
+func NewRaftConsensusModule(nodeId int) *RaftConsensusModule {
+	return &RaftConsensusModule{
+		MU:                                  sync.Mutex{},
+		Id:                                  nodeId,
+		NodeState:                           Follower,
+		TimeSinceNodeStartedElectionTimeOut: time.Now(),
+	}
 }
 
 type RequestVoteArgs struct {
@@ -98,3 +111,57 @@ func (rcm *RaftConsensusModule) ShouldGrantVote(candidateTerm, candidateId int) 
 }
 
 func (rcm *RaftConsensusModule) StartElection() {}
+
+// The paper specified that the randomized timeout should be from 150 to 300 ms to avoid indefintely elections
+func (rcm *RaftConsensusModule) GetRandomizedElectionTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+}
+
+// This function is running on the background for all nodes all the lifetime of the ndoes
+// any node has a leader election timeout = 150~300ms
+// so every 5 ms I will check if:
+//   - This node became a leader of this term
+//   - If this term is outdated and we need to mark ourself as follower and update our term and reset our leader election timeout
+//   - If the leader election timeout has expired and we still didn't hear from the leader any heartbeat or a RV from any candidate so we have to start an election
+func (rcm *RaftConsensusModule) ShouldStartLeaderElection() {
+	rcm.MU.Lock()
+	lastSeenTerm := rcm.CurrentTerm
+	rcm.MU.Unlock()
+
+	ticker := time.NewTicker(time.Millisecond * 5)
+	electionTimeoutOfThisNode := rcm.GetRandomizedElectionTimeout()
+
+	for {
+		<-ticker.C // block 5 ms then do the checking
+		// we will read data from the consensus module so we have to lock whenerver we access any state to be thread safe
+		rcm.MU.Lock()
+		if lastSeenTerm < rcm.CurrentTerm {
+			// we have an outdated term
+			rcm.NodeState = Follower
+			rcm.MU.Unlock()
+			log.Printf("Node [%v] has an outdated term [%v] and the current term is [%v]\n", rcm.Id, lastSeenTerm, rcm.CurrentTerm)
+			// TODO : should i reset my leader election timeout ?
+			return
+		}
+
+		notLeaderState := []NodeState{Follower, Candidate}
+		if !slices.Contains(notLeaderState, rcm.NodeState) {
+			log.Printf("Node [%v] became the leader of term [%v]\n", rcm.Id, rcm.CurrentTerm)
+			rcm.MU.Unlock()
+			// here we shouldn't reset out timeout because this node is the leader and will keep sending periodically heartbeats in parallel to all followers
+			return
+		}
+
+		// now we need to check if we haven't receive any heartbeat or RV requests for the entire election timeout
+		timeSinceLastLeaderElectionEnded := time.Since(rcm.TimeSinceNodeStartedElectionTimeOut)
+		if timeSinceLastLeaderElectionEnded > electionTimeoutOfThisNode {
+			// we need to start an election to become a candidate
+			rcm.StartElection()
+			rcm.MU.Unlock()
+			return
+		}
+
+		rcm.MU.Unlock()
+	}
+
+}
