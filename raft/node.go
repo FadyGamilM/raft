@@ -7,6 +7,7 @@ const (
 	Follower  NodeState = 0b00
 	Candidate NodeState = 0b01
 	Leader    NodeState = 0b10
+	Crashed   NodeState = 0b11
 )
 
 func (ns NodeState) String() string {
@@ -17,6 +18,8 @@ func (ns NodeState) String() string {
 		return "Candidate"
 	case Leader:
 		return "Leader"
+	case Crashed:
+		return "Crashed"
 	default:
 		return "UNKNOWN"
 	}
