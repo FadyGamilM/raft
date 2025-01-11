@@ -34,9 +34,9 @@ type RaftConsensusModule struct {
 	LastAppliedLogIndex int
 
 	// =====> statses persisted on volatile storage for leader node only [reInitilized after election]
-	ElectionTimeout                     time.Time
-	HeartbeatTimeout                    time.Time
-	TimeSinceNodeStartedElectionTimeOut time.Time
+	ElectionTimeout  time.Time
+	HeartbeatTimeout time.Time
+	// TimeSinceNodeStartedElectionTimeOut time.Time
 
 	// TODO : we will implement a proper cluster membership algorithm later and i think the type of this NodesIds will change to hold the configurations
 	NodesIds []int
@@ -47,12 +47,12 @@ type RaftConsensusModule struct {
 
 func NewRaftConsensusModule(nodeId int, clusterConfigurations ClusterConfigurations) *RaftConsensusModule {
 	raftConsensusModule := &RaftConsensusModule{
-		MU:                                  sync.Mutex{},
-		Id:                                  nodeId,
-		NodeState:                           Follower,
-		TimeSinceNodeStartedElectionTimeOut: time.Now(),
-		NodesIds:                            clusterConfigurations.NodesIds,
-		rpcNodes:                            make(map[int]*rpc.Client),
+		MU:              sync.Mutex{},
+		Id:              nodeId,
+		NodeState:       Follower,
+		ElectionTimeout: time.Now(),
+		NodesIds:        clusterConfigurations.NodesIds,
+		rpcNodes:        make(map[int]*rpc.Client),
 	}
 
 	for _, peerId := range clusterConfigurations.NodesIds {
@@ -169,6 +169,7 @@ func (rcm *RaftConsensusModule) BackgroundLeaderElectionTimer() {
 			return
 		}
 
+		// since we are calling this BackgroundLeaderElectionTimer into go routine at the end of StartElection() rpc incase we didn't won the electon, we need to ensure here that this new election will be triggered if we didn't won the old election that spawn this go routine
 		notLeaderState := []NodeState{Follower, Candidate}
 		if !slices.Contains(notLeaderState, rcm.NodeState) {
 			log.Printf("Node [%v] became the leader of term [%v]\n", rcm.Id, rcm.CurrentTerm)
@@ -178,7 +179,7 @@ func (rcm *RaftConsensusModule) BackgroundLeaderElectionTimer() {
 		}
 
 		// now we need to check if we haven't receive any heartbeat or RV requests for the entire election timeout
-		timeSinceLastLeaderElectionEnded := time.Since(rcm.TimeSinceNodeStartedElectionTimeOut)
+		timeSinceLastLeaderElectionEnded := time.Since(rcm.ElectionTimeout)
 		if timeSinceLastLeaderElectionEnded > electionTimeoutOfThisNode {
 			// we need to start an election to become a candidate
 			rcm.MU.Unlock() // i beleive we should unlock before starting the election because the election will perform in-parallel rpc calls to all nodes, and these rpc requests might hangout for a while and this will affect liveness of our node state .. maybe this needs more further investgation later
@@ -197,12 +198,67 @@ func (rcm *RaftConsensusModule) StartElection() {
 	rcm.MU.Lock()
 	rcm.NodeState = Candidate
 	rcm.VotedFor = rcm.Id
+	rcm.CurrentTerm += 1
+	RVCandidateId := rcm.Id
+	RVCandidateTerm := rcm.CurrentTerm
+	rcm.ElectionTimeout = time.Now() // reset our election timeout
 	rcm.MU.Unlock()
 
-	for _, nodeId := range rcm.NodesIds {
-		// RPC CALL TO THIS NODE
+	votesGranted := 1
 
+	for _, nodeId := range rcm.NodesIds {
+		go func(nodeId int) {
+			// TODO : should we lock on the mutex ??
+			rcm.MU.Lock()
+			defer rcm.MU.Unlock()
+
+			if nodeId == rcm.Id {
+				return
+			}
+
+			RVArgs := &RequestVoteArgs{
+				CandidateId: RVCandidateId,
+				Term:        RVCandidateTerm,
+			}
+			RVReply := &RequestVoteReply{}
+			if err := rcm.rpcNodes[nodeId].Call("RaftConsensusModule.RequestVote_RPC", RVArgs, RVReply); err != nil {
+				log.Printf("failed to send RV rpc call to node [%v] for term [%v] where the candidate is [%v] error [%v]\n", nodeId, RVCandidateTerm, RVCandidateId, err.Error())
+				return
+			}
+
+			// TODO : do we really need this ?
+			// we always have to check while we wait for the response that we are still candidate
+
+			// Check if we got this node's vote
+			if RVReply.Term != RVCandidateTerm {
+				log.Printf("discovered a higher term [%v] from node [%v] while I was candidate for term = [%v]\n", RVReply.Term, nodeId, RVCandidateTerm)
+				rcm.NodeState = Follower
+				rcm.VotedFor = -1
+				rcm.ElectionTimeout = time.Now()
+				rcm.CurrentTerm = RVReply.Term
+				go rcm.BackgroundLeaderElectionTimer()
+				return
+			}
+
+			if RVReply.Term == RVCandidateTerm {
+				votesGranted++
+				if rcm.IsQuorum(votesGranted) {
+					rcm.Leader()
+				}
+
+			}
+
+		}(nodeId)
 	}
 
-	votesGranted := 1
+	// always run the background job for another election timeout incase we didn't won this election, if we won, the state checking in the background job method will not trigger the election logic
+	go rcm.BackgroundLeaderElectionTimer()
+}
+
+func (rcm *RaftConsensusModule) IsQuorum(votesGranted int) bool {
+	return votesGranted >= ((len(rcm.NodesIds) / 2) + 1)
+}
+
+func (rcm *RaftConsensusModule) Leader() {
+
 }
