@@ -5,7 +5,6 @@ import (
 	"log"
 	"math/rand"
 	"net/rpc"
-	"slices"
 	"sync"
 	"time"
 )
@@ -35,7 +34,7 @@ type RaftConsensusModule struct {
 
 	// =====> statses persisted on volatile storage for leader node only [reInitilized after election]
 	ElectionTimeout  time.Time
-	HeartbeatTimeout time.Time
+	HeartbeatTimeout time.Duration
 	// TimeSinceNodeStartedElectionTimeOut time.Time
 
 	// TODO : we will implement a proper cluster membership algorithm later and i think the type of this NodesIds will change to hold the configurations
@@ -43,16 +42,20 @@ type RaftConsensusModule struct {
 
 	// for network communicaton between nodes
 	rpcNodes map[int]*rpc.Client
+
+	matchIndex []*NodeLastReplicatedLogIndex
+	nextIndex  []*NodeNextLogIndexToSend
 }
 
 func NewRaftConsensusModule(nodeId int, clusterConfigurations ClusterConfigurations) *RaftConsensusModule {
 	raftConsensusModule := &RaftConsensusModule{
-		MU:              sync.Mutex{},
-		Id:              nodeId,
-		NodeState:       Follower,
-		ElectionTimeout: time.Now(),
-		NodesIds:        clusterConfigurations.NodesIds,
-		rpcNodes:        make(map[int]*rpc.Client),
+		MU:               sync.Mutex{},
+		Id:               nodeId,
+		NodeState:        Follower,
+		ElectionTimeout:  time.Now(),
+		NodesIds:         clusterConfigurations.NodesIds,
+		rpcNodes:         make(map[int]*rpc.Client),
+		HeartbeatTimeout: time.Millisecond * 20,
 	}
 
 	for _, peerId := range clusterConfigurations.NodesIds {
@@ -68,59 +71,6 @@ func NewRaftConsensusModule(nodeId int, clusterConfigurations ClusterConfigurati
 	}
 
 	return raftConsensusModule
-}
-
-type RequestVoteArgs struct {
-	CandidateId int
-	Term        int // the term we are voting for leadership for
-	// the next two fields are for picking the candidate who has the heighest log as discussed in the paper
-	LastLogIndex int // index of candidate’s last log entry
-	LastLogTerm  int // term of candidate’s last log entry
-}
-
-// all nodes reply to this rpc by the term number they saw, and the vote result based on the validation
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-/*
-Validation:
-  - If the received term is less than the term we already saw, we refuse the vote request
-  - If the received term is higher than the one we saw:
-  - we enforce our state to be Follower node
-  - we enforce the term we saw to be the received term
-  - we set the votedFor field to be -1
-*/
-func (rcm *RaftConsensusModule) RequestVote_RPC(req *RequestVoteArgs) (*RequestVoteReply, error) {
-	rcm.MU.Lock()
-	defer rcm.MU.Unlock()
-	reply := &RequestVoteReply{
-		Term:        rcm.CurrentTerm,
-		VoteGranted: false,
-	}
-
-	if rcm.CurrentTerm > req.Term {
-		return reply, nil
-	}
-
-	if rcm.CurrentTerm < req.Term {
-		// so this node (the follower) knew that there is a candidate for a higher term, so we vote for it
-		rcm.NodeState = Follower
-		rcm.CurrentTerm = req.Term
-		rcm.VotedFor = -1
-		// reset my election timeout so after a while if we didn't hear from this candidate becoming a leader or any other candidate, we start an election for our own
-		rcm.ElectionTimeout = time.Now()
-		go rcm.BackgroundLeaderElectionTimer()
-	}
-
-	if rcm.ShouldGrantVote(req.Term, req.CandidateId) {
-		rcm.VotedFor = req.CandidateId
-		reply.VoteGranted = true
-		reply.Term = rcm.CurrentTerm
-	}
-
-	return reply, nil
 }
 
 func (rcm *RaftConsensusModule) ShouldGrantVote(candidateTerm, candidateId int) bool {
@@ -170,8 +120,7 @@ func (rcm *RaftConsensusModule) BackgroundLeaderElectionTimer() {
 		}
 
 		// since we are calling this BackgroundLeaderElectionTimer into go routine at the end of StartElection() rpc incase we didn't won the electon, we need to ensure here that this new election will be triggered if we didn't won the old election that spawn this go routine
-		notLeaderState := []NodeState{Follower, Candidate}
-		if !slices.Contains(notLeaderState, rcm.NodeState) {
+		if rcm.NodeState == Leader {
 			log.Printf("Node [%v] became the leader of term [%v]\n", rcm.Id, rcm.CurrentTerm)
 			rcm.MU.Unlock()
 			// here we shouldn't reset out timeout because this node is the leader and will keep sending periodically heartbeats in parallel to all followers
@@ -230,13 +179,9 @@ func (rcm *RaftConsensusModule) StartElection() {
 			// we always have to check while we wait for the response that we are still candidate
 
 			// Check if we got this node's vote
-			if RVReply.Term != RVCandidateTerm {
+			if RVReply.Term > RVCandidateTerm {
 				log.Printf("discovered a higher term [%v] from node [%v] while I was candidate for term = [%v]\n", RVReply.Term, nodeId, RVCandidateTerm)
-				rcm.NodeState = Follower
-				rcm.VotedFor = -1
-				rcm.ElectionTimeout = time.Now()
-				rcm.CurrentTerm = RVReply.Term
-				go rcm.BackgroundLeaderElectionTimer()
+				rcm.Follower(RVReply.Term)
 				return
 			}
 
@@ -260,5 +205,59 @@ func (rcm *RaftConsensusModule) IsQuorum(votesGranted int) bool {
 }
 
 func (rcm *RaftConsensusModule) Leader() {
+	rcm.MU.Lock()
+	rcm.NodeState = Leader
+	log.Printf("leader of term [%v] is node [%v]\n", rcm.CurrentTerm, rcm.Id)
+	heartbeatTickerDuration := rcm.HeartbeatTimeout
+	rcm.MU.Unlock()
 
+	heartbeatTicker := time.NewTicker(heartbeatTickerDuration)
+
+	for {
+		// first heartbeat is sent immeiedtly, then we send it every 20 ms
+		rcm.MU.Lock()
+		AppendEntryCurrentTerm := rcm.CurrentTerm
+		AppendEntryLeaderId := rcm.Id
+		rcm.MU.Unlock()
+
+		for _, nodeId := range rcm.NodesIds {
+			go func(nodeId int) {
+				AEReply := &AppendEntryReply{}
+				AEArgs := &AppendEntryArgs{
+					Term:     AppendEntryCurrentTerm,
+					LeaderId: AppendEntryLeaderId,
+				}
+				if err := rcm.rpcNodes[nodeId].Call("RaftConsensusModule.AppendEntry_RPC", AEArgs, AEReply); err != nil {
+					log.Printf("failed to heartbeat node [%v] at term [%v]\n", nodeId, AppendEntryCurrentTerm)
+					return
+				}
+
+				rcm.MU.Lock()
+				if AEReply.Success {
+					if AEReply.Term > rcm.CurrentTerm {
+						rcm.Follower(AEReply.Term)
+					}
+				}
+				rcm.MU.Unlock()
+			}(nodeId)
+		}
+
+		<-heartbeatTicker.C
+		// are we still the leader ?
+		rcm.MU.Lock()
+		if rcm.NodeState != Leader {
+			// if we are not the leader, this for sure because other go routine called Follower() method, so no need to call it again
+			rcm.MU.Unlock()
+			return
+		}
+		rcm.MU.Unlock()
+	}
+}
+
+func (rcm *RaftConsensusModule) Follower(term int) {
+	rcm.NodeState = Follower
+	rcm.VotedFor = -1
+	rcm.ElectionTimeout = time.Now()
+	rcm.CurrentTerm = term
+	go rcm.BackgroundLeaderElectionTimer()
 }
