@@ -38,3 +38,7 @@ type NodeNextLogIndexToSend struct {
 	NodeId             int
 	NextLogIndexToSend int
 }
+
+type ClusterConfigurations struct {
+	NodesIds []int
+}

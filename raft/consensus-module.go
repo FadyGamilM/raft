@@ -1,8 +1,10 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
+	"net/rpc"
 	"slices"
 	"sync"
 	"time"
@@ -35,15 +37,37 @@ type RaftConsensusModule struct {
 	ElectionTimeout                     time.Time
 	HeartbeatTimeout                    time.Time
 	TimeSinceNodeStartedElectionTimeOut time.Time
+
+	// TODO : we will implement a proper cluster membership algorithm later and i think the type of this NodesIds will change to hold the configurations
+	NodesIds []int
+
+	// for network communicaton between nodes
+	rpcNodes map[int]*rpc.Client
 }
 
-func NewRaftConsensusModule(nodeId int) *RaftConsensusModule {
-	return &RaftConsensusModule{
+func NewRaftConsensusModule(nodeId int, clusterConfigurations ClusterConfigurations) *RaftConsensusModule {
+	raftConsensusModule := &RaftConsensusModule{
 		MU:                                  sync.Mutex{},
 		Id:                                  nodeId,
 		NodeState:                           Follower,
 		TimeSinceNodeStartedElectionTimeOut: time.Now(),
+		NodesIds:                            clusterConfigurations.NodesIds,
+		rpcNodes:                            make(map[int]*rpc.Client),
 	}
+
+	for _, peerId := range clusterConfigurations.NodesIds {
+		if peerId != nodeId {
+			// Assuming each node runs on a different port starting from 8000
+			rpcClient, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", 8000+peerId))
+			if err != nil {
+				log.Printf("Failed to connect to peer %d: %v", peerId, err)
+				continue
+			}
+			raftConsensusModule.rpcNodes[peerId] = rpcClient
+		}
+	}
+
+	return raftConsensusModule
 }
 
 type RequestVoteArgs struct {
@@ -69,6 +93,8 @@ Validation:
   - we set the votedFor field to be -1
 */
 func (rcm *RaftConsensusModule) RequestVote_RPC(req *RequestVoteArgs) (*RequestVoteReply, error) {
+	rcm.MU.Lock()
+	defer rcm.MU.Unlock()
 	reply := &RequestVoteReply{
 		Term:        rcm.CurrentTerm,
 		VoteGranted: false,
@@ -82,13 +108,14 @@ func (rcm *RaftConsensusModule) RequestVote_RPC(req *RequestVoteArgs) (*RequestV
 		// so this node (the follower) knew that there is a candidate for a higher term, so we vote for it
 		rcm.NodeState = Follower
 		rcm.CurrentTerm = req.Term
-		rcm.VotedFor = req.CandidateId
+		rcm.VotedFor = -1
 		// reset my election timeout so after a while if we didn't hear from this candidate becoming a leader or any other candidate, we start an election for our own
 		rcm.ElectionTimeout = time.Now()
-		go rcm.StartElection()
+		go rcm.BackgroundLeaderElectionTimer()
 	}
 
-	if rcm.CurrentTerm == req.Term && (rcm.VotedFor == -1 || rcm.VotedFor == req.CandidateId) {
+	if rcm.ShouldGrantVote(req.Term, req.CandidateId) {
+		rcm.VotedFor = req.CandidateId
 		reply.VoteGranted = true
 		reply.Term = rcm.CurrentTerm
 	}
@@ -110,8 +137,6 @@ func (rcm *RaftConsensusModule) ShouldGrantVote(candidateTerm, candidateId int) 
 	return false
 }
 
-func (rcm *RaftConsensusModule) StartElection() {}
-
 // The paper specified that the randomized timeout should be from 150 to 300 ms to avoid indefintely elections
 func (rcm *RaftConsensusModule) GetRandomizedElectionTimeout() time.Duration {
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
@@ -123,7 +148,7 @@ func (rcm *RaftConsensusModule) GetRandomizedElectionTimeout() time.Duration {
 //   - This node became a leader of this term
 //   - If this term is outdated and we need to mark ourself as follower and update our term and reset our leader election timeout
 //   - If the leader election timeout has expired and we still didn't hear from the leader any heartbeat or a RV from any candidate so we have to start an election
-func (rcm *RaftConsensusModule) ShouldStartLeaderElection() {
+func (rcm *RaftConsensusModule) BackgroundLeaderElectionTimer() {
 	rcm.MU.Lock()
 	lastSeenTerm := rcm.CurrentTerm
 	rcm.MU.Unlock()
@@ -156,12 +181,28 @@ func (rcm *RaftConsensusModule) ShouldStartLeaderElection() {
 		timeSinceLastLeaderElectionEnded := time.Since(rcm.TimeSinceNodeStartedElectionTimeOut)
 		if timeSinceLastLeaderElectionEnded > electionTimeoutOfThisNode {
 			// we need to start an election to become a candidate
+			rcm.MU.Unlock() // i beleive we should unlock before starting the election because the election will perform in-parallel rpc calls to all nodes, and these rpc requests might hangout for a while and this will affect liveness of our node state .. maybe this needs more further investgation later
 			rcm.StartElection()
-			rcm.MU.Unlock()
 			return
 		}
 
 		rcm.MU.Unlock()
 	}
 
+}
+
+// a follower decided to start an election, which means the follower will become a candidate, and start sending RV requests to all other nodes/
+// StartElection method is called from the background timeout election job, and this job already locks on the consensus module states so if we locked here we will fail
+func (rcm *RaftConsensusModule) StartElection() {
+	rcm.MU.Lock()
+	rcm.NodeState = Candidate
+	rcm.VotedFor = rcm.Id
+	rcm.MU.Unlock()
+
+	for _, nodeId := range rcm.NodesIds {
+		// RPC CALL TO THIS NODE
+
+	}
+
+	votesGranted := 1
 }
