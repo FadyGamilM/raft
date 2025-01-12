@@ -25,8 +25,8 @@ Validation:
   - we set the votedFor field to be -1
 */
 func (rcm *RaftConsensusModule) RequestVote_RPC(req *RequestVoteArgs) (*RequestVoteReply, error) {
-	rcm.MU.Lock()
-	defer rcm.MU.Unlock()
+	rcm.mu.Lock()
+	defer rcm.mu.Unlock()
 	reply := &RequestVoteReply{
 		Term:        rcm.CurrentTerm,
 		VoteGranted: false,
@@ -50,38 +50,40 @@ func (rcm *RaftConsensusModule) RequestVote_RPC(req *RequestVoteArgs) (*RequestV
 }
 
 type AppendEntryArgs struct {
-	Term     int
-	LeaderId int
-
-	// other fields will be implemented later when we implement the rpelicate log behavior
+	term              int
+	leaderId          int
+	prevLogIndex      int
+	prevLogTerm       int
+	entries           []LogEntry
+	leaderCommitIndex int
 }
 
 type AppendEntryReply struct {
-	Term    int
-	Success bool
+	term    int
+	success bool
 }
 
 func (rcm *RaftConsensusModule) AppendEntry_RPC(args *AppendEntryArgs) (*AppendEntryReply, error) {
 	reply := &AppendEntryReply{
-		Term:    args.Term,
-		Success: false,
+		term:    args.term,
+		success: false,
 	}
-	rcm.MU.Lock()
-	if rcm.CurrentTerm < args.Term {
-		rcm.Follower(args.Term)
+	rcm.mu.Lock()
+	if rcm.CurrentTerm < args.term {
+		rcm.Follower(args.term)
 	}
 
-	if rcm.CurrentTerm == args.Term {
+	if rcm.CurrentTerm == args.term {
 		// if we are candidate voting for this term we should become a follower because raft allows only one leader per term
 		if rcm.NodeState == Candidate {
-			rcm.Follower(args.Term)
+			rcm.Follower(args.term)
 		}
 
-		reply.Success = true
+		reply.success = true
 		// reset our election timer because we jsut received a heartbeat
-		rcm.ElectionTimeout = time.Now()
+		rcm.electionTimeout = time.Now()
 	}
 
-	rcm.MU.Unlock()
+	rcm.mu.Unlock()
 	return reply, nil
 }

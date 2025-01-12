@@ -26,14 +26,14 @@ func (ns NodeState) String() string {
 }
 
 // to handle the matchIndex[] field
-// the server should know for each node on the cluster, what is the last replicated log index on it (incase that our server is the leader)
+// the server should know for each node on the cluster, what is the last replicated log index on it's log (incase that our server is the leader)
 type NodeLastReplicatedLogIndex struct {
 	NodeId                 int
 	LastReplicatedLogIndex int
 }
 
 // to handle the nextIndex[] field
-// the server should know for each node on the cluster, what is the next log index should be snet (incase that our server is the leader)
+// the server should know for each node on the cluster, what is the next log index should be sent (incase that our server is the leader)
 type NodeNextLogIndexToSend struct {
 	NodeId             int
 	NextLogIndexToSend int
