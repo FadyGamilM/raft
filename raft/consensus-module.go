@@ -45,18 +45,21 @@ type RaftConsensusModule struct {
 
 	// to catch updates on the commit index
 	commitIndexUpdatedChan chan struct{}
+
+	appliedEntriesToClientChan chan LogEntry
 }
 
 func NewRaftConsensusModule(nodeId int, clusterConfigurations ClusterConfigurations) *RaftConsensusModule {
 	raftConsensusModule := &RaftConsensusModule{
-		mu:                     sync.Mutex{},
-		Id:                     nodeId,
-		NodeState:              Follower,
-		electionTimeout:        time.Now(),
-		NodesIds:               clusterConfigurations.NodesIds,
-		rpcNodes:               make(map[int]*rpc.Client),
-		heartbeatTimeout:       time.Millisecond * 20,
-		commitIndexUpdatedChan: make(chan struct{}),
+		mu:                         sync.Mutex{},
+		Id:                         nodeId,
+		NodeState:                  Follower,
+		electionTimeout:            time.Now(),
+		NodesIds:                   clusterConfigurations.NodesIds,
+		rpcNodes:                   make(map[int]*rpc.Client),
+		heartbeatTimeout:           time.Millisecond * 20,
+		commitIndexUpdatedChan:     make(chan struct{}),
+		appliedEntriesToClientChan: make(chan LogEntry),
 	}
 
 	for _, peerId := range clusterConfigurations.NodesIds {
@@ -379,6 +382,42 @@ func (rcm *RaftConsensusModule) UpdateCommitIndex(lastCommittedIndex int) {
 
 		if rcm.LastComittedIndex != lastCommittedIndex {
 			rcm.commitIndexUpdatedChan <- struct{}{}
+		}
+	}
+}
+
+// this runs on a separate go routine that runs by the time the node is up
+// and this method listens on the <- commitedIndexUpdatedChan
+//
+//	[0, 1, 2, 3, 4, 5]
+//
+// a      *
+// c            *
+//
+// entries = [2, 3]
+// cmds_indexes := [{2 + 0 + 1}, {2 + 1 + 1}]
+func (rcm *RaftConsensusModule) ApplyLogEntiresAfterCommitting() {
+	for {
+		select {
+		case <-rcm.commitIndexUpdatedChan:
+			rcm.mu.Lock()
+			termWhenThisUpdateOccured := rcm.CurrentTerm
+			lastAppliedLogSentToClient := rcm.LastAppliedLogIndex
+
+			entriesToBeAppleidToClient := []LogEntry{}
+			if lastAppliedLogSentToClient < rcm.LastComittedIndex {
+				entriesToBeAppleidToClient = append(entriesToBeAppleidToClient, rcm.Log[lastAppliedLogSentToClient+1:rcm.LastComittedIndex+1]...)
+				rcm.LastAppliedLogIndex = rcm.LastComittedIndex
+			}
+			rcm.mu.Unlock()
+
+			for idx, entryToBeApplied := range entriesToBeAppleidToClient {
+				rcm.appliedEntriesToClientChan <- LogEntry{
+					Cmd:   entryToBeApplied.Cmd,
+					Term:  termWhenThisUpdateOccured,            // not the term of the entry because we are applying it to the client at this current term not the term's original entry
+					Index: idx + lastAppliedLogSentToClient + 1, // explained at function description
+				}
+			}
 		}
 	}
 }
