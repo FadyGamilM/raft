@@ -46,20 +46,20 @@ type RaftConsensusModule struct {
 	// to catch updates on the commit index
 	commitIndexUpdatedChan chan struct{}
 
-	appliedEntriesToClientChan chan LogEntry
+	commitChan chan LogEntry
 }
 
 func NewRaftConsensusModule(nodeId int, clusterConfigurations ClusterConfigurations) *RaftConsensusModule {
 	raftConsensusModule := &RaftConsensusModule{
-		mu:                         sync.Mutex{},
-		Id:                         nodeId,
-		NodeState:                  Follower,
-		electionTimeout:            time.Now(),
-		NodesIds:                   clusterConfigurations.NodesIds,
-		rpcNodes:                   make(map[int]*rpc.Client),
-		heartbeatTimeout:           time.Millisecond * 20,
-		commitIndexUpdatedChan:     make(chan struct{}),
-		appliedEntriesToClientChan: make(chan LogEntry),
+		mu:                     sync.Mutex{},
+		Id:                     nodeId,
+		NodeState:              Follower,
+		electionTimeout:        time.Now(),
+		NodesIds:               clusterConfigurations.NodesIds,
+		rpcNodes:               make(map[int]*rpc.Client),
+		heartbeatTimeout:       time.Millisecond * 20,
+		commitIndexUpdatedChan: make(chan struct{}),
+		commitChan:             make(chan LogEntry),
 	}
 
 	for _, peerId := range clusterConfigurations.NodesIds {
@@ -293,19 +293,19 @@ func (rcm *RaftConsensusModule) SendHeartbeat() {
 				return
 			}
 
-			LastCommitedLogIndexForThisPeer := peerNextIndexInfo.NextLogIndexToSend - 1
-			lastCommittedLogTermForThisPeer := -1
+			LastReplicatedLogIndexForThisPeer := peerNextIndexInfo.NextLogIndexToSend - 1
+			lastReplicatedLogTermForThisPeer := -1
 			// if this peer already had cmds in it's log
-			if LastCommitedLogIndexForThisPeer >= 0 {
-				lastCommittedLogTermForThisPeer = rcm.Log[LastCommitedLogIndexForThisPeer].Term
+			if LastReplicatedLogIndexForThisPeer >= 0 {
+				lastReplicatedLogTermForThisPeer = rcm.Log[LastReplicatedLogIndexForThisPeer].Term
 			}
 			allEntrieFromLeaderLogsAfterTheLastCommittedIndexOnThisPeer := rcm.Log[peerNextIndexInfo.NextLogIndexToSend:]
 
 			AEArgs := &AppendEntryArgs{
 				term:              leaderCurrentTerm,
 				leaderId:          rcm.Id,
-				prevLogIndex:      LastCommitedLogIndexForThisPeer,
-				prevLogTerm:       lastCommittedLogTermForThisPeer,
+				prevLogIndex:      LastReplicatedLogIndexForThisPeer,
+				prevLogTerm:       lastReplicatedLogTermForThisPeer,
 				entries:           allEntrieFromLeaderLogsAfterTheLastCommittedIndexOnThisPeer,
 				leaderCommitIndex: rcm.LastComittedIndex,
 			}
@@ -412,7 +412,7 @@ func (rcm *RaftConsensusModule) ApplyLogEntiresAfterCommitting() {
 			rcm.mu.Unlock()
 
 			for idx, entryToBeApplied := range entriesToBeAppleidToClient {
-				rcm.appliedEntriesToClientChan <- LogEntry{
+				rcm.commitChan <- LogEntry{
 					Cmd:   entryToBeApplied.Cmd,
 					Term:  termWhenThisUpdateOccured,            // not the term of the entry because we are applying it to the client at this current term not the term's original entry
 					Index: idx + lastAppliedLogSentToClient + 1, // explained at function description

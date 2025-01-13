@@ -79,9 +79,11 @@ func (rcm *RaftConsensusModule) AppendEntry_RPC(args *AppendEntryArgs) (*AppendE
 			rcm.Follower(args.term)
 		}
 
-		reply.success = true
 		// reset our election timer because we jsut received a heartbeat
 		rcm.electionTimeout = time.Now()
+
+		
+		reply.success = true
 	}
 
 	rcm.mu.Unlock()
