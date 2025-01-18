@@ -141,16 +141,23 @@ func (r *RaftNode) StartElection() {
 	calusterNodesNum := len(r.ClusterNodesIds)
 	termOfthisElection := r.currentTerm
 	RVArgs := &RequestVoteArgs{
-		CandidateId: r.NodeId,
-		Term:        r.currentTerm,
+		CandidateId:  r.NodeId,
+		Term:         r.currentTerm,
+		LastLogIndex: -1, // inital value
+		LastLogTerm:  -1, // initial value
 	}
 
+	// if we already have log entries, we can sned our last log index and term
 	if len(r.logs) > 0 {
-
+		RVArgs.LastLogIndex = r.logs[len(r.logs)-1].index
+		RVArgs.LastLogTerm = r.logs[len(r.logs)-1].term
 	}
 
-	grantedVotes := 1 // voted for myself
 	r.mu.Unlock()
+
+	// I will use separate mutex for acessing the grantedVotes thread safely because for the ToLeader() ToFollower() ToCandidate() methods and other methods too will need to acuqire lock on the node mutex, so i don't want to stop other logic and cause a deadlock while i am locking on the grantedVote to do some checking
+	voteMutex := sync.Mutex{}
+	grantedVotes := 1 // voted for myself
 
 	wg := sync.WaitGroup{}
 
@@ -164,6 +171,9 @@ func (r *RaftNode) StartElection() {
 		wg.Add(1)
 		// because one of the go routines might cause state changing to follower or leader .. we must have a condition within every go routine to check if the state is still candidate to send the request
 		go func(peerId uint8, peerAddress string) {
+			// defer the ending of the wait group to avoid go routines leaking and the main routine (StartElection go routine will never ends and will keep waiting this leaked go routine)
+			defer wg.Done()
+
 			// TODO : should we acquire lock on the mutex or what ??
 			r.mu.Lock()
 			currentState := r.state
@@ -182,27 +192,24 @@ func (r *RaftNode) StartElection() {
 
 			log.Printf("RV_for_term_[%v]: RV_reply_from_peer_[%v]_is_[%v]\n", termOfthisElection, peerId, RVReply)
 
-			if RVReply.Term >= int(RVArgs.Term) {
+			if RVReply.Term > int(termOfthisElection) {
 				log.Printf("RV_for_term_[%v]: found_higher_term_than_RV_term_from_RV_reply_from_node_[%v]\n", termOfthisElection, peerId)
 
 				r.ToFollower(int64(RVReply.Term))
-
 				return
 			}
 
 			if RVReply.VoteGranted {
-				// Thread safe
-				r.mu.Lock()
+				voteMutex.Lock()
 				grantedVotes++
-				r.mu.Unlock()
-			}
+				if grantedVotes >= (calusterNodesNum/2)+1 {
+					log.Printf("RV_for_term_[%v]: got_quorum_granted_votes_changing_to_leader\n", termOfthisElection)
 
-			if grantedVotes >= (calusterNodesNum/2)+1 {
-				log.Printf("RV_for_term_[%v]: got_quorum_granted_votes_changing_to_leader\n", termOfthisElection)
-
-				r.ToLeader()
-
-				return
+					r.ToLeader()
+					voteMutex.Unlock()
+					return
+				}
+				voteMutex.Unlock()
 			}
 
 		}(peerId, peerAddress)
