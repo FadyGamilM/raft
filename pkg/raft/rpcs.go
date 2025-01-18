@@ -45,6 +45,61 @@ type LogEntry struct {
 	index int
 }
 
+func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEntryReply) error {
+	return nil
+}
+
+func (r *RaftNode) RequestVoteHandler_RPC(args *RequestVoteArgs, reply *RequestVoteReply) error {
+	return nil
+}
+
+// =========== sending rpcs requests (network calls) ============
+func (r *RaftNode) SendAppendEntry(peerId uint8, req *AppendEntryArgs) (*AppendEntryReply, error) {
+	r.mu.Lock()
+	peerAddress, exists := r.ClusterNodesIds[peerId]
+	r.mu.Unlock()
+
+	res := &AppendEntryReply{}
+
+	if !exists {
+		return res, fmt.Errorf("peer_[%v]_is_not_connected_to_the_node_[%v]_right_now", peerId, r.NodeId)
+	}
+
+	peerClient, err := rpc.Dial("tcp", peerAddress)
+	if err != nil {
+		return res, fmt.Errorf("failed_to_dial_peer_[%v]_with_address_[%v]_from_node_[%v]_with_error_[%s]", peerId, peerAddress, r.NodeId, err.Error())
+	}
+
+	if err := peerClient.Call("RaftNode.AppendEntryHandler_RPC", req, res); err != nil {
+		return res, fmt.Errorf("AppendEntry()_from_peer_[%v]_with_address_[%v]_returned_error_[%v]", peerId, peerAddress, err.Error())
+	}
+
+	return res, nil
+}
+
+func (r *RaftNode) SendRequestVote(peerId uint8, req *RequestVoteArgs) (*RequestVoteReply, error) {
+	r.mu.Lock()
+	peerAddress, exists := r.ClusterNodesIds[peerId]
+	r.mu.Unlock()
+
+	res := &RequestVoteReply{}
+
+	if !exists {
+		return res, fmt.Errorf("peer_[%v]_is_not_connected_to_the_node_[%v]_right_now", peerId, r.NodeId)
+	}
+
+	peerClient, err := rpc.Dial("tcp", peerAddress)
+	if err != nil {
+		return res, fmt.Errorf("failed_to_dial_peer_[%v]_with_address_[%v]_from_node_[%v]_with_error_[%s]", peerId, peerAddress, r.NodeId, err.Error())
+	}
+
+	if err := peerClient.Call("RaftNode.RequestVoteHandler_RPC", req, res); err != nil {
+		return res, fmt.Errorf("RequestVote()_from_peer_[%v]_with_address_[%v]_returned_error_[%v]", peerId, peerAddress, err.Error())
+	}
+
+	return res, nil
+}
+
 type Args struct {
 	SenderId uint8
 	ReqMsg   string
@@ -66,7 +121,7 @@ func (r *RaftNode) SendMsgToPeer(peerId uint8, Msg *Args) (string, error) {
 	peerAddress, exists := r.ClusterNodesIds[peerId]
 	r.mu.Unlock()
 	if !exists {
-		return "", fmt.Errorf("peer [%v] not connected to the node [%v] right now", peerId, r.NodeId)
+		return "", fmt.Errorf("peer [%v] is not connected to the node [%v] right now", peerId, r.NodeId)
 	}
 
 	// connect to the rpc server on this address
