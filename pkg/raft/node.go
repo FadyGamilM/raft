@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -9,6 +10,8 @@ import (
 type RaftNode struct {
 	NodeId          uint8
 	ClusterNodesIds map[uint8]string
+
+	state NodeState
 
 	minElectionTimeout int64
 	maxElectionTimeout int64
@@ -22,6 +25,31 @@ type RaftNode struct {
 	startElectionChan       chan struct{}
 	receivedAppendEntryChan chan struct{} // this channel will notify the ElectionWorker thread either we got new entry or just a normal heartbeat
 	receivedRequestVoteChan chan struct{}
+}
+
+// the paper described only 3 states for a raft node, so I won't store it as a string to avoid extra space (byte/char) and will represent it using 8 bits (with only 2 used bits)
+type NodeState uint8
+
+const (
+	Follower  NodeState = 0b00
+	Candidate NodeState = 0b01
+	Leader    NodeState = 0b10
+	Crashed   NodeState = 0b11
+)
+
+func (ns NodeState) String() string {
+	switch ns {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Crashed:
+		return "Crashed"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func NewRaftNode(Id uint8, clusterNodesIds map[uint8]string) *RaftNode {
@@ -98,8 +126,71 @@ func (r *RaftNode) StartElection() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.state = Candidate
+	r.currentTerm += 1
+	grantedVotes := 1 // voted for myself
+	calusterNodesNum := len(r.ClusterNodesIds)
+	termVotedFor := r.currentTerm
+
+	RVArgs := &RequestVoteArgs{
+		CandidateId: r.NodeId,
+		Term:        r.currentTerm,
+	}
+
+	for peerId, peerAddress := range r.ClusterNodesIds {
+		// because one of the go routines might cause state changing to follower or leader .. we must have a condition within every go routine to check if the state is still candidate to send the request
+		go func(peerId uint8, peerAddress string) {
+			// TODO : should we acquire lock on the mutex or what ??
+			r.mu.Lock()
+			currentState := r.state
+			r.mu.Unlock()
+
+			if currentState != Candidate {
+				log.Printf("RV_for_term_[%v]: current_State_changed_to_[%v]\n", termVotedFor, currentState)
+				return
+			}
+
+			RVReply, err := r.SendRequestVote(peerId, peerAddress, RVArgs)
+			if err != nil {
+				log.Printf("RV_for_term_[%v]: error_[%v]_sending_request_vote_to_peer_[%v]\n", termVotedFor, err.Error(), peerId)
+				return
+			}
+
+			log.Printf("RV_for_term_[%v]: RV_reply_from_peer_[%v]_is_[%v]\n", termVotedFor, peerId, RVReply)
+
+			if RVReply.Term >= int(RVArgs.Term) {
+				log.Printf("RV_for_term_[%v]: found_higher_term_than_RV_term_from_RV_reply_from_node_[%v]\n", termVotedFor, peerId)
+
+				r.ToFollower()
+
+				return
+			}
+
+			if RVReply.VoteGranted {
+				grantedVotes++
+			}
+
+			if grantedVotes >= (calusterNodesNum/2)+1 {
+				log.Printf("RV_for_term_[%v]: got_quorum_granted_votes_changing_to_leader\n", termVotedFor)
+
+				r.ToLeader()
+
+				return
+			}
+
+		}(peerId, peerAddress)
+	}
+
 }
 
 func (r *RaftNode) HandleAppendEntry() {}
 
 func (r *RaftNode) HandleRequestVote() {}
+
+func (r *RaftNode) ToFollower() {
+	// first step i think is to reset our electionTimeout
+}
+
+func (r *RaftNode) ToCandidate() {}
+
+func (r *RaftNode) ToLeader() {}

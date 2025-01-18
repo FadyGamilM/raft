@@ -12,8 +12,8 @@ import (
 )
 
 type RequestVoteArgs struct {
-	CandidateId int
-	Term        int // the term we are voting for leadership for
+	CandidateId uint8
+	Term        int64 // the term we are voting for leadership for
 	// the next two fields are for picking the candidate who has the heighest log as discussed in the paper
 	LastLogIndex int // index of candidate’s last log entry
 	LastLogTerm  int // term of candidate’s last log entry
@@ -54,16 +54,8 @@ func (r *RaftNode) RequestVoteHandler_RPC(args *RequestVoteArgs, reply *RequestV
 }
 
 // =========== sending rpcs requests (network calls) ============
-func (r *RaftNode) SendAppendEntry(peerId uint8, req *AppendEntryArgs) (*AppendEntryReply, error) {
-	r.mu.Lock()
-	peerAddress, exists := r.ClusterNodesIds[peerId]
-	r.mu.Unlock()
-
+func (r *RaftNode) SendAppendEntry(peerId uint8, peerAddress string, req *AppendEntryArgs) (*AppendEntryReply, error) {
 	res := &AppendEntryReply{}
-
-	if !exists {
-		return res, fmt.Errorf("peer_[%v]_is_not_connected_to_the_node_[%v]_right_now", peerId, r.NodeId)
-	}
 
 	peerClient, err := rpc.Dial("tcp", peerAddress)
 	if err != nil {
@@ -77,16 +69,8 @@ func (r *RaftNode) SendAppendEntry(peerId uint8, req *AppendEntryArgs) (*AppendE
 	return res, nil
 }
 
-func (r *RaftNode) SendRequestVote(peerId uint8, req *RequestVoteArgs) (*RequestVoteReply, error) {
-	r.mu.Lock()
-	peerAddress, exists := r.ClusterNodesIds[peerId]
-	r.mu.Unlock()
-
+func (r *RaftNode) SendRequestVote(peerId uint8, peerAddress string, req *RequestVoteArgs) (*RequestVoteReply, error) {
 	res := &RequestVoteReply{}
-
-	if !exists {
-		return res, fmt.Errorf("peer_[%v]_is_not_connected_to_the_node_[%v]_right_now", peerId, r.NodeId)
-	}
 
 	peerClient, err := rpc.Dial("tcp", peerAddress)
 	if err != nil {
