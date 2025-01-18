@@ -31,9 +31,7 @@ func main() {
 	node.ClusterNodesIds[uint8(1)] = peerAddress
 
 	// Send a message to the peer
-	reply, err := node.SendMsgToPeer(uint8(1), &raft.Args{
-		ReqMsg: "Hello from " + nodeID,
-	})
+	reply, err := node.SendAppendEntry(uint8(1), &raft.AppendEntryArgs{})
 	if err != nil {
 		fmt.Println("Error sending message:", err)
 	} else {
