@@ -383,4 +383,26 @@ func (r *RaftNode) SendHeartbeatToPeers() {
 	}
 }
 
+func (r *RaftNode) AppendNewEntry(command string) bool {
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return false
+	}
+
+	newEntry := LogEntry{
+		cmd:   command,
+		term:  int(r.currentTerm),
+		index: len(r.logs),
+	}
+
+	r.logs = append(r.logs, newEntry)
+
+	log.Printf("leader_[%v]: appended_new_entry_[%v]_at_index_[%v]\n", r.NodeId, command, newEntry.index)
+
+	r.mu.Unlock()
+
+	return true
+}
+
 // TODO  we must have a go routine that always checks the matchIndex of the majority of nodes and if we get a matchIndex for all majority of node on a specific index we just mark this index as committed into our (leader) log and maybe we should start sending COMMIT RPC containing the leader.CommitIndex to all other nodes for this entry
