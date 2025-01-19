@@ -8,8 +8,8 @@ import (
 )
 
 type RaftNode struct {
-	NodeId          uint8
-	ClusterNodesIds map[uint8]string
+	NodeId          int
+	ClusterNodesIds map[int]string
 
 	state NodeState
 
@@ -21,7 +21,7 @@ type RaftNode struct {
 
 	mu *sync.Mutex
 
-	votedForNodeId *uint8
+	votedForNodeId *int
 
 	// channels for communications between background threads
 	startElectionChan       chan struct{}
@@ -29,6 +29,17 @@ type RaftNode struct {
 	receivedRequestVoteChan chan struct{}
 
 	logs []LogEntry
+
+	// for each peerId, what is the next-index on this peer that we are sending this entry for
+	//                           0  1  2  3
+	// so if the follower.log = [9, 4, 6,  ] , the nextIndex of this peer is 3
+	// TODO ----> IMPORTANT HINT : once the nextIndex of this peer is > len(leader.logs) we are sending the AppendEntry rpc as a heartbeat not appendEntry
+	nextIndex map[int]int64
+
+	// for each peerId, what is the index in this peer log that we as a leader completely sure that we and this peer are agreed on this logEntry and this is durable
+	matchIndex map[int]int64
+
+	commitIndex int64
 }
 
 // the paper described only 3 states for a raft node, so I won't store it as a string to avoid extra space (byte/char) and will represent it using 8 bits (with only 2 used bits)
@@ -56,7 +67,7 @@ func (ns NodeState) String() string {
 	}
 }
 
-func NewRaftNode(Id uint8, clusterNodesIds map[uint8]string) *RaftNode {
+func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
 
 	server := &RaftNode{
 		NodeId:          Id,
@@ -67,6 +78,9 @@ func NewRaftNode(Id uint8, clusterNodesIds map[uint8]string) *RaftNode {
 	server.minElectionTimeout = 150
 	server.maxElectionTimeout = 300
 	server.currentTerm = 0
+	server.commitIndex = -1
+	server.nextIndex = map[int]int64{}
+	server.matchIndex = map[int]int64{}
 
 	server.ResetElectionTimeout()
 
@@ -170,7 +184,7 @@ func (r *RaftNode) StartElection() {
 
 		wg.Add(1)
 		// because one of the go routines might cause state changing to follower or leader .. we must have a condition within every go routine to check if the state is still candidate to send the request
-		go func(peerId uint8, peerAddress string) {
+		go func(peerId int, peerAddress string) {
 			// defer the ending of the wait group to avoid go routines leaking and the main routine (StartElection go routine will never ends and will keep waiting this leaked go routine)
 			defer wg.Done()
 
@@ -226,7 +240,7 @@ func (r *RaftNode) isCandidateHasTheUpToDateLog(candidateLastLogIndex, candidate
 	if len(r.logs) > 0 {
 		// if candidate log and follower log end with the same term, the longer log is the more up to date log
 		if r.logs[len(r.logs)-1].term == int(candidateLastLogTerm) {
-			return candidateLastLogIndex >= r.logs[len(r.logs)-1].index
+			return candidateLastLogIndex >= r.logs[len(r.logs)-1].index // ack this candidate as up-to-date log if only his log length is higher or equales ours if we both have the same lastLogTerm
 		}
 
 		// if not the same term, the higher term log is the up to date one
@@ -242,8 +256,12 @@ func (r *RaftNode) HandleAppendEntry() {}
 func (r *RaftNode) HandleRequestVote() {}
 
 func (r *RaftNode) ToFollower(term int64) {
-	// first step i think is to reset our electionTimeout
-	// change the state to follower
+	r.mu.Lock()
+	r.state = Follower
+	r.currentTerm = term
+	r.votedForNodeId = nil
+	r.ResetElectionTimeout()
+	r.mu.Unlock()
 }
 
 func (r *RaftNode) ToCandidate() {
@@ -255,3 +273,5 @@ func (r *RaftNode) ToLeader() {
 	// first step i think is to reset our electionTimeout
 	// change the state to leader
 }
+
+// TODO  we must have a go routine that always checks the matchIndex of the majority of nodes and if we get a matchIndex for all majority of node on a specific index we just mark this index as committed into our (leader) log and maybe we should start sending COMMIT RPC containing the leader.CommitIndex to all other nodes for this entry
