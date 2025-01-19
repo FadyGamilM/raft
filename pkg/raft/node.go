@@ -69,29 +69,30 @@ type RaftNode struct {
 }
 
 func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
-
 	server := &RaftNode{
-		NodeId:          Id,
-		ClusterNodesIds: clusterNodesIds,
-		mu:              &sync.Mutex{},
+		NodeId:                  Id,
+		ClusterNodesIds:         clusterNodesIds,
+		mu:                      &sync.Mutex{},
+		startElectionChan:       make(chan struct{}),
+		receivedAppendEntryChan: make(chan struct{}),
+		receivedRequestVoteChan: make(chan struct{}),
+		state:                   Follower,
+		currentTerm:             0,
+		commitIndex:             -1,
+		nextIndex:               make(map[int]int64),
+		matchIndex:              make(map[int]int64),
+		logs:                    make([]LogEntry, 0),
 	}
 
-	server.minElectionTimeout = 150 // ms
-	server.maxElectionTimeout = 300 // ms
-	server.heartbeatTimeout = 50    // ms
-	server.currentTerm = 0
-	server.commitIndex = -1
-	server.nextIndex = map[int]int64{}
-	server.matchIndex = map[int]int64{}
+	server.minElectionTimeout = 150
+	server.maxElectionTimeout = 300
+	server.heartbeatTimeout = 50
 
 	server.ResetElectionTimeout()
 
-	// handles the following :
-	// - if timeout expired -> start election
-	// - if AppendEntry rpc handler received a rpc request -> perform AE logic
-	// - if RequestVote rpc handler received a rpc request -> perform RV logic
+	// Start background workers
 	go server.RaftBackgroundWorker()
-	server.ResetElectionTimeout()
+	go server.CommitIndexWorker()
 
 	return server
 }
@@ -289,19 +290,44 @@ func (r *RaftNode) SendHeartbeatToPeers() {
 		select {
 		case <-heartbeatTimer.C:
 			r.mu.Lock()
-			AEArgs := &AppendEntryArgs{
-				term:              int(r.currentTerm),
-				leaderId:          r.NodeId,
-				prevLogIndex:      -1,
-				prevLogTerm:       -1,
-				entries:           []LogEntry{},
-				leaderCommitIndex: int(r.commitIndex),
+			if r.state != Leader {
+				log.Println("not_leader_to_send_heartbeat_request")
+				r.mu.Unlock()
+				return
 			}
+			r.mu.Unlock()
 
 			for peerId, peerAddress := range r.ClusterNodesIds {
+				r.mu.Lock()
 				if peerId == r.NodeId {
 					continue
 				}
+
+				//  we should replicate the logs if we have something to send to this peer
+				nextIdx := r.nextIndex[peerId]
+				prevLogIndex := nextIdx - 1
+				prevLogTerm := int64(-1)
+
+				// Find the term for prevLogIndex
+				if prevLogIndex >= 0 && int(prevLogIndex) < len(r.logs) {
+					prevLogTerm = int64(r.logs[prevLogIndex].term)
+				}
+
+				// Prepare entries to send
+				var entries []LogEntry
+				if nextIdx < int64(len(r.logs)) {
+					entries = r.logs[nextIdx:]
+				}
+
+				AEArgs := &AppendEntryArgs{
+					term:              int(r.currentTerm),
+					leaderId:          r.NodeId,
+					prevLogIndex:      -1,
+					prevLogTerm:       int(prevLogTerm),
+					entries:           entries,
+					leaderCommitIndex: int(r.commitIndex),
+				}
+				r.mu.Unlock()
 
 				go func(peerId int, peerAddress string) {
 					AEReply, err := r.SendAppendEntry(peerId, peerAddress, AEArgs)
@@ -318,12 +344,40 @@ func (r *RaftNode) SendHeartbeatToPeers() {
 					}
 					r.mu.Unlock()
 
+					// if we replicated the log successfully, we should update the nextIndex of this peer
 					if AEReply.success {
 						log.Printf("AE_for_term_[%v]: peer_[%v]_replied_with_success\n", AEArgs.term, peerId)
+
+						// i set the len(AEArgs.entries) > 0 condition to check if we actually wanted to replicate our logs
+						if len(AEArgs.entries) > 0 {
+							// if leader log is [ [1:t1], [2:t2], [4:t2], [3:t3] ]
+							// if follower log is [ [1:t1], [2:t2] ]
+							// so nextIndex of this folllower was 2 before sending the heartbeat
+							// so lastLogIndex of this follower before sending the request was 1
+							// so entires sent to be replicated are [ [4:t2], [3:t3] ]
+							// so after the request nextIndex should be = 4 because follower log is now [ [1:t1], [2:t2], [4:t2], [3:t3] ]
+							// and the matchIndex should be = 4-1 = 3
+							r.mu.Lock()
+							r.nextIndex[peerId] = int64(AEArgs.prevLogIndex) + int64(len(AEArgs.entries)) + 1
+							r.matchIndex[peerId] = r.nextIndex[peerId] - 1
+							r.mu.Unlock()
+						}
+
 						return
+					} else {
+						// we just failed to replicate the new entries starting from the next indexx, but the matchIndex is already agreed to be repicated so no need to update it
+						r.mu.Lock()
+						r.nextIndex[peerId]--
+						log.Printf("AE_for_term_[%v]: peer_[%v]_replied_with_failure_so_decrementing_the_nextIndex_to_[%v]\n", AEArgs.term, peerId, r.nextIndex[peerId])
+						r.mu.Unlock()
+
 					}
 				}(peerId, peerAddress)
 			}
+
+			// reset our heartbeat timer
+			r.mu.Lock()
+			heartbeatTimer.Reset(time.Duration(r.heartbeatTimeout * int64(time.Millisecond)))
 			r.mu.Unlock()
 		}
 	}
