@@ -22,16 +22,16 @@ func main() {
 	// Create the node
 	node_id, _ := strconv.Atoi(nodeID)
 
-	node := raft.NewRaftNode(uint8(node_id), map[uint8]string{uint8(1): "peer"})
+	node := raft.NewRaftNode((node_id), map[int]string{(1): "peer"})
 
 	// Start the RPC server
 	go raft.StartGrpcServer(node, nodeAddress)
 
 	// Connect to the peer
-	node.ClusterNodesIds[uint8(1)] = peerAddress
+	node.ClusterNodesIds[(1)] = peerAddress
 
 	// Send a message to the peer
-	reply, err := node.SendAppendEntry(uint8(1), &raft.AppendEntryArgs{})
+	reply, err := node.SendAppendEntry((1), peerAddress, &raft.AppendEntryArgs{})
 	if err != nil {
 		fmt.Println("Error sending message:", err)
 	} else {
