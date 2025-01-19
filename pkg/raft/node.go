@@ -276,4 +276,52 @@ func (r *RaftNode) ToLeader() {
 	// change the state to leader
 }
 
+func (r *RaftNode) SendHeartbeatToPeers() {
+	heartbeatTimer := time.NewTimer(time.Duration(r.heartbeatTimeout * int64(time.Millisecond))) // every 50 ms
+	heartbeatTimer.Stop()
+
+	for {
+		select {
+		case <-heartbeatTimer.C:
+			r.mu.Lock()
+			AEArgs := &AppendEntryArgs{
+				term:              int(r.currentTerm),
+				leaderId:          r.NodeId,
+				prevLogIndex:      -1,
+				prevLogTerm:       -1,
+				entries:           []LogEntry{},
+				leaderCommitIndex: int(r.commitIndex),
+			}
+
+			for peerId, peerAddress := range r.ClusterNodesIds {
+				if peerId == r.NodeId {
+					continue
+				}
+
+				go func(peerId int, peerAddress string) {
+					AEReply, err := r.SendAppendEntry(peerId, peerAddress, AEArgs)
+					if err != nil {
+						log.Printf("AE_for_term_[%v]: error_[%v]_sending_heartbeat_to_peer_[%v]\n", AEArgs.term, err.Error(), peerId)
+						return
+					}
+
+					r.mu.Lock()
+					if AEReply.term > int(r.currentTerm) {
+						log.Printf("AE_for_term_[%v]: found_higher_term_[%v]_from_peer_[%v]_while_my_current_term_is_[%v]_switching_to_follower_now\n", AEArgs.term, AEReply.term, peerId, r.currentTerm)
+						r.ToFollower(int64(AEReply.term))
+						return
+					}
+					r.mu.Unlock()
+
+					if AEReply.success {
+						log.Printf("AE_for_term_[%v]: peer_[%v]_replied_with_success\n", AEArgs.term, peerId)
+						return
+					}
+				}(peerId, peerAddress)
+			}
+			r.mu.Unlock()
+		}
+	}
+}
+
 // TODO  we must have a go routine that always checks the matchIndex of the majority of nodes and if we get a matchIndex for all majority of node on a specific index we just mark this index as committed into our (leader) log and maybe we should start sending COMMIT RPC containing the leader.CommitIndex to all other nodes for this entry
