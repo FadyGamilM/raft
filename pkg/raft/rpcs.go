@@ -76,11 +76,11 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 
 	// we should reject appendEntries rpc from previous terms
 	if currentTerm > int64(args.term) {
-		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_with_term_[%v]_less_than_current_term_[%v]", nodeId, args.leaderId, currentTerm, args.term)
+		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_with_term_[%v]_less_than_current_term_[%v]\n", nodeId, args.leaderId, currentTerm, args.term)
 		return nil
 	}
 
-	// we should update our term and change our state to follower (in case we became a leader and received this appendEntires rpc) incase we received a higher term request
+	// we should update our term and change our state to follower (in case we became a leader and received this appendEntires rpc with a higher term request)
 	if currentTerm < int64(args.term) {
 		r.mu.Lock()
 		// reset our states required to represent a follower node
@@ -88,14 +88,25 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 		r.mu.Unlock()
 	}
 
+	// TODO : should we add this validation before any other vlaidaton on the AppendEntries logic and after validation on the term to separate between the heartbeat AE rpc and the regular AE rpc ?
+	if len(args.entries) == 0 {
+		log.Printf("received_heartbeat_appendEntries_rpc_from_leader_[%v]_at_term_[%v]\n", args.leaderId, args.term)
+		r.ToFollower(int64(args.term))
+		reply = &AppendEntryReply{
+			term:    int(args.term),
+			success: true,
+		}
+		return nil
+	}
+
 	// the checking of log consistency after preparing the entryIndexAtPrevLogIndex and entryTermAtPrevLogTerm
 	if entryIndexAtPrevLogIndex == -1 {
-		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_but_has_no_log_entry_at_prevLogIndex_[%v]", nodeId, args.leaderId, args.prevLogIndex)
+		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_but_has_no_log_entry_at_prevLogIndex_[%v]\n", nodeId, args.leaderId, args.prevLogIndex)
 		return nil // the leader will decrement his knowledge of our preLogIndex and send it into the next AE rpc
 	}
 	// so we have log at this index, lets check its term
 	if entryTermAtPrevLogIndex != args.prevLogTerm {
-		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_has_log_entry_at_prevLogIndex_[%v]_but_has_term_[%v]_while_prevLogTerm_is_[%v]", nodeId, args.leaderId, args.prevLogIndex, entryTermAtPrevLogIndex, args.prevLogTerm)
+		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_has_log_entry_at_prevLogIndex_[%v]_but_has_term_[%v]_while_prevLogTerm_is_[%v]\n", nodeId, args.leaderId, args.prevLogIndex, entryTermAtPrevLogIndex, args.prevLogTerm)
 		return nil // the leader will decrement his knowledge of our preLogIndex and send it into the next AE rpc
 	}
 

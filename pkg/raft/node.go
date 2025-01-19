@@ -7,6 +7,31 @@ import (
 	"time"
 )
 
+// the paper described only 3 states for a raft node, so I won't store it as a string to avoid extra space (byte/char) and will represent it using 8 bits (with only 2 used bits)
+type NodeState uint8
+
+const (
+	Follower  NodeState = 0b00
+	Candidate NodeState = 0b01
+	Leader    NodeState = 0b10
+	Crashed   NodeState = 0b11
+)
+
+func (ns NodeState) String() string {
+	switch ns {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Crashed:
+		return "Crashed"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 type RaftNode struct {
 	NodeId          int
 	ClusterNodesIds map[int]string
@@ -16,6 +41,7 @@ type RaftNode struct {
 	minElectionTimeout int64
 	maxElectionTimeout int64
 	electionTimeout    int64
+	heartbeatTimeout   int64
 
 	currentTerm int64
 
@@ -42,31 +68,6 @@ type RaftNode struct {
 	commitIndex int64
 }
 
-// the paper described only 3 states for a raft node, so I won't store it as a string to avoid extra space (byte/char) and will represent it using 8 bits (with only 2 used bits)
-type NodeState uint8
-
-const (
-	Follower  NodeState = 0b00
-	Candidate NodeState = 0b01
-	Leader    NodeState = 0b10
-	Crashed   NodeState = 0b11
-)
-
-func (ns NodeState) String() string {
-	switch ns {
-	case Follower:
-		return "Follower"
-	case Candidate:
-		return "Candidate"
-	case Leader:
-		return "Leader"
-	case Crashed:
-		return "Crashed"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
 
 	server := &RaftNode{
@@ -75,8 +76,9 @@ func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
 		mu:              &sync.Mutex{},
 	}
 
-	server.minElectionTimeout = 150
-	server.maxElectionTimeout = 300
+	server.minElectionTimeout = 150 // ms
+	server.maxElectionTimeout = 300 // ms
+	server.heartbeatTimeout = 50    // ms
 	server.currentTerm = 0
 	server.commitIndex = -1
 	server.nextIndex = map[int]int64{}
