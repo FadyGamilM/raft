@@ -451,3 +451,12 @@ func (r *RaftNode) CommitIndexWorker() {
 		r.mu.Unlock()
 	}
 }
+
+func (r *RaftNode) applyCommittedEntriesToStateMachine(oldCommittedIndex, newCommittedIndex int64) {
+	// the last committed index is already applied so we start from old + 1
+	for i := oldCommittedIndex + 1; i <= newCommittedIndex; i++ {
+		command := r.logs[i].cmd
+		// TODO:  Apply command to your state machine
+		log.Printf("node_[%d]_applying_command_[%v]_at_index_[%d]", r.NodeId, command, i)
+	}
+}

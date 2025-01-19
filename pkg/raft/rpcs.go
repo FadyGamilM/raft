@@ -119,7 +119,12 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 	// finally update our local commit index
 	// i will set it = the min of leader's commit index or the index of last entry at my log because we might have logs that leader don't know about so we will take the leader's commit index in this case (since we alreay replicated the leader log we are sure that we already covered this leader's commit index)
 	r.mu.Lock()
-	r.commitIndex = int64(min(args.leaderCommitIndex, len(r.logs)-1))
+	newCommittedIndex := int64(min(args.leaderCommitIndex, len(r.logs)-1))
+	if r.commitIndex < newCommittedIndex {
+		latestAppliedCommittedIndexToStateMachine := r.commitIndex
+		r.commitIndex = newCommittedIndex
+		go r.applyCommittedEntriesToStateMachine(latestAppliedCommittedIndexToStateMachine, r.commitIndex)
+	}
 	r.mu.Unlock()
 
 	// this handler also should listen on a channel that the worker after processsing the request should return the reply into this channel here so this handler return the reply to the rpc caller
