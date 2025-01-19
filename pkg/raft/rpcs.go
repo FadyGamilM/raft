@@ -80,13 +80,13 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 		return nil
 	}
 
-	// we should update our term and change our state to follower (in case we became a leader and received this appendEntires rpc with a higher term request)
+	// we should update our term and change our state to follower (in case we were a leader and received this appendEntires rpc with a higher term request)
 	if currentTerm < int64(args.term) {
-		r.mu.Lock()
 		// reset our states required to represent a follower node
 		r.ToFollower(int64(args.term))
-		r.mu.Unlock()
 	}
+
+	// NOW we have the same term we can negotiate if this leader is valid or not
 
 	// TODO : should we add this validation before any other vlaidaton on the AppendEntries logic and after validation on the term to separate between the heartbeat AE rpc and the regular AE rpc ?
 	if len(args.entries) == 0 {
@@ -127,8 +127,52 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 }
 
 func (r *RaftNode) RequestVoteHandler_RPC(args *RequestVoteArgs, reply *RequestVoteReply) error {
+	// TODO: i beleive we sohuld deifne this channel as a chan of RV_Args not just struct
+	// r.receivedRequestVoteChan <- struct{}{}
 
-	r.receivedRequestVoteChan <- struct{}{}
+	r.mu.Lock()
+	currentTerm := r.currentTerm
+	r.mu.Unlock()
+
+	reply = &RequestVoteReply{
+		Term:        int(currentTerm),
+		VoteGranted: false,
+	}
+
+	// if we have higher term just return because its an invalid RV request
+	if currentTerm > args.Term {
+		log.Printf("received_requestVote_rpc_with_lower_term_[%v]_from_candidate_[%v]_while_my_current_term_is_[%v]\n", args.Term, args.CandidateId, currentTerm)
+		return nil
+	}
+
+	// if we have outdated term, we just turn ourself into follower to set our current term to the updated term, them set the reply term with the last term we updtaead ourself with
+	if currentTerm < args.Term {
+		r.ToFollower(args.Term)
+		reply.Term = int(args.Term)
+	}
+
+	// NOW we have the same term we can negotiate if this leader is valid or not
+
+	// did we voted for any candidate at this term or not ?
+	r.mu.Lock()
+	if r.votedForNodeId != nil && r.votedForNodeId != &args.CandidateId {
+		log.Printf("we_already_voted_for_another_candidate_with_id_[%v]_for_this_term_[%v]_before\n", *r.votedForNodeId, args.Term)
+		return nil
+	}
+	r.mu.Unlock()
+
+	// so we are at the same term or lower than the candidate term
+	// we need to check the received candidate log vs ours, to check if this candidate has the up to date log or not
+	isCandidateUpToDate := r.isCandidateHasTheUpToDateLog(args.LastLogIndex, args.LastLogTerm)
+	if isCandidateUpToDate {
+		r.mu.Lock()
+		reply.VoteGranted = true
+		r.votedForNodeId = &args.CandidateId
+		// reset our election timer because we already heared form a candidate
+		r.ResetElectionTimeout()
+		r.mu.Unlock()
+	}
+
 	return nil
 }
 

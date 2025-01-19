@@ -274,6 +274,11 @@ func (r *RaftNode) ToCandidate() {
 func (r *RaftNode) ToLeader() {
 	// first step i think is to reset our electionTimeout
 	// change the state to leader
+	r.mu.Lock()
+	r.state = Leader
+	r.mu.Unlock()
+
+	go r.SendHeartbeatToPeers()
 }
 
 func (r *RaftNode) SendHeartbeatToPeers() {
