@@ -51,8 +51,11 @@ type RaftNode struct {
 
 	// channels for communications between background threads
 	startElectionChan       chan struct{}
-	receivedAppendEntryChan chan struct{} // this channel will notify the ElectionWorker thread either we got new entry or just a normal heartbeat
-	receivedRequestVoteChan chan struct{}
+	receivedAppendEntryChan chan *AppendEntryArgs // this channel will notify the ElectionWorker thread either we got new entry or just a normal heartbeat
+	receivedRequestVoteChan chan *RequestVoteArgs
+
+	AppendEntryReplyChan chan *AppendEntryReply
+	RequestVoteReplyChan chan *RequestVoteReply
 
 	logs []LogEntry
 
@@ -74,8 +77,10 @@ func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
 		ClusterNodesIds:         clusterNodesIds,
 		mu:                      &sync.Mutex{},
 		startElectionChan:       make(chan struct{}),
-		receivedAppendEntryChan: make(chan struct{}),
-		receivedRequestVoteChan: make(chan struct{}),
+		receivedAppendEntryChan: make(chan *AppendEntryArgs),
+		receivedRequestVoteChan: make(chan *RequestVoteArgs),
+		AppendEntryReplyChan:    make(chan *AppendEntryReply),
+		RequestVoteReplyChan:    make(chan *RequestVoteReply),
 		state:                   Follower,
 		currentTerm:             0,
 		commitIndex:             -1,
@@ -116,6 +121,12 @@ func (r *RaftNode) RaftBackgroundWorker() {
 		case <-electionTimeoutExpiryTimer.C:
 			// should it be a go routine ?
 			go r.StartElection()
+
+		case args := <-r.receivedAppendEntryChan:
+			go r.HandleAppendEntry(args)
+
+		case <-r.receivedRequestVoteChan:
+			go r.HandleRequestVote()
 		}
 	}
 
@@ -231,6 +242,89 @@ func (r *RaftNode) isCandidateHasTheUpToDateLog(candidateLastLogIndex, candidate
 	// if my log is empty (length is zero), so if the candidate log have at least one entry, its up to date for me
 	return candidateLastLogIndex > 0
 }
+
+func (r *RaftNode) HandleAppendEntry(args *AppendEntryArgs) {
+	r.mu.Lock()
+	currentTerm := r.currentTerm
+	currentState := r.state
+	entryIndexAtPrevLogIndex, entryTermAtPrevLogIndex := -1, -1
+
+	// if me as follower have a log entry at the prevLogIndex && this logEntry at this index has term matches the PrevLogEntry .. so we match the leader logs at this point
+	if len(r.logs) >= args.prevLogIndex && args.prevLogIndex > 0 {
+		entryIndexAtPrevLogIndex = r.logs[args.prevLogIndex].index
+		entryTermAtPrevLogIndex = r.logs[args.prevLogIndex].term
+	}
+
+	nodeId := r.NodeId
+	r.mu.Unlock()
+
+	reply := &AppendEntryReply{
+		term:    int(r.currentTerm),
+		success: false,
+	}
+
+	if currentState == Leader {
+		r.AppendEntryReplyChan <- reply
+	}
+
+	// we should reject appendEntries rpc from previous terms
+	if currentTerm > int64(args.term) {
+		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_with_term_[%v]_less_than_current_term_[%v]\n", nodeId, args.leaderId, currentTerm, args.term)
+		r.AppendEntryReplyChan <- reply
+	}
+
+	// we should update our term and change our state to follower (in case we were a leader and received this appendEntires rpc with a higher term request)
+	if currentTerm < int64(args.term) {
+		// reset our states required to represent a follower node
+		r.ToFollower(int64(args.term))
+	}
+
+	// NOW we have the same term we can negotiate if this leader is valid or not
+
+	// TODO : should we add this validation before any other vlaidaton on the AppendEntries logic and after validation on the term to separate between the heartbeat AE rpc and the regular AE rpc ?
+	if len(args.entries) == 0 {
+		log.Printf("received_heartbeat_appendEntries_rpc_from_leader_[%v]_at_term_[%v]\n", args.leaderId, args.term)
+		r.ToFollower(int64(args.term))
+		reply = &AppendEntryReply{
+			term:    int(args.term),
+			success: true,
+		}
+		r.AppendEntryReplyChan <- reply
+	}
+
+	// the checking of log consistency after preparing the entryIndexAtPrevLogIndex and entryTermAtPrevLogTerm
+	if entryIndexAtPrevLogIndex == -1 {
+		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_but_has_no_log_entry_at_prevLogIndex_[%v]\n", nodeId, args.leaderId, args.prevLogIndex)
+		r.AppendEntryReplyChan <- reply // the leader will decrement his knowledge of our preLogIndex and send it into the next AE rpc
+	}
+	// so we have log at this index, lets check its term
+	if entryTermAtPrevLogIndex != args.prevLogTerm {
+		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_has_log_entry_at_prevLogIndex_[%v]_but_has_term_[%v]_while_prevLogTerm_is_[%v]\n", nodeId, args.leaderId, args.prevLogIndex, entryTermAtPrevLogIndex, args.prevLogTerm)
+		r.AppendEntryReplyChan <- reply // the leader will decrement his knowledge of our preLogIndex and send it into the next AE rpc
+	}
+
+	// so we matched a consistent log with the leader at the point of PrevLogIndex
+	// so we are ready to append the entries from the prevLogIndex + 1 to the end
+	r.mu.Lock()
+	r.logs = append(r.logs[:args.prevLogIndex], args.entries...)
+	r.mu.Unlock()
+
+	// finally update our local commit index
+	// i will set it = the min of leader's commit index or the index of last entry at my log because we might have logs that leader don't know about so we will take the leader's commit index in this case (since we alreay replicated the leader log we are sure that we already covered this leader's commit index)
+	r.mu.Lock()
+	newCommittedIndex := int64(min(args.leaderCommitIndex, len(r.logs)-1))
+	if r.commitIndex < newCommittedIndex {
+		latestAppliedCommittedIndexToStateMachine := r.commitIndex
+		r.commitIndex = newCommittedIndex
+		go r.applyCommittedEntriesToStateMachine(latestAppliedCommittedIndexToStateMachine, r.commitIndex)
+	}
+	r.mu.Unlock()
+
+	// this handler also should listen on a channel that the worker after processsing the request should return the reply into this channel here so this handler return the reply to the rpc caller
+	r.AppendEntryReplyChan <- reply
+}
+
+func (r *RaftNode) HandleRequestVote() {}
 
 func (r *RaftNode) ToFollower(term int64) {
 	r.mu.Lock()
