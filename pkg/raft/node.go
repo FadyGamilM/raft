@@ -53,6 +53,8 @@ type RaftNode struct {
 	startElectionChan       chan struct{}
 	receivedAppendEntryChan chan struct{} // this channel will notify the ElectionWorker thread either we got new entry or just a normal heartbeat
 	receivedRequestVoteChan chan struct{}
+	commitIndexUpdatedChan  chan struct{}
+	CommitChan              chan LogEntry
 
 	logs []LogEntry
 
@@ -65,31 +67,38 @@ type RaftNode struct {
 	// for each peerId, what is the index in this peer log that we as a leader completely sure that we and this peer are agreed on this logEntry and this is durable
 	matchIndex map[int]int64
 
-	commitIndex int64
+	commitIndex      int64
+	lastAppliedIndex int64
+
+	lastTimeElectionTimeoutGetReset time.Time
 }
 
-func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
+func NewRaftNode(Id int, clusterNodesIds map[int]string, clusterIsReady <-chan struct{}) *RaftNode {
 	server := &RaftNode{
-		NodeId:                  Id,
-		ClusterNodesIds:         clusterNodesIds,
-		mu:                      &sync.Mutex{},
-		startElectionChan:       make(chan struct{}),
-		receivedAppendEntryChan: make(chan struct{}),
-		receivedRequestVoteChan: make(chan struct{}),
-		state:                   Follower,
-		currentTerm:             0,
-		commitIndex:             -1,
-		nextIndex:               make(map[int]int64),
-		matchIndex:              make(map[int]int64),
-		logs:                    make([]LogEntry, 0),
+		NodeId:                          Id,
+		ClusterNodesIds:                 clusterNodesIds,
+		mu:                              &sync.Mutex{},
+		startElectionChan:               make(chan struct{}),
+		receivedAppendEntryChan:         make(chan struct{}),
+		receivedRequestVoteChan:         make(chan struct{}),
+		commitIndexUpdatedChan:          make(chan struct{}),
+		CommitChan:                      make(chan LogEntry),
+		state:                           Follower,
+		currentTerm:                     0,
+		commitIndex:                     -1,
+		lastAppliedIndex:                -1,
+		nextIndex:                       make(map[int]int64),
+		matchIndex:                      make(map[int]int64),
+		logs:                            make([]LogEntry, 0),
+		lastTimeElectionTimeoutGetReset: time.Now(),
 	}
 
 	server.minElectionTimeout = 150
 	server.maxElectionTimeout = 300
 	server.heartbeatTimeout = 50
 
+	<-clusterIsReady
 	server.ResetElectionTimeout()
-
 	// Start background workers
 	go server.RaftBackgroundWorker()
 	go server.CommitIndexWorker()
@@ -97,25 +106,48 @@ func NewRaftNode(Id int, clusterNodesIds map[int]string) *RaftNode {
 	return server
 }
 
-func (r *RaftNode) ResetElectionTimeout() {
+func (r *RaftNode) getElectionTimeout() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// return a random timeout = 150 + ( random-number-from [0:150[ ])
 	r.electionTimeout = r.minElectionTimeout + int64(rand.Int63n(r.maxElectionTimeout-r.minElectionTimeout))
+	return r.electionTimeout
+}
+
+func (r *RaftNode) ResetElectionTimeout() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastTimeElectionTimeoutGetReset = time.Now()
 }
 
 func (r *RaftNode) RaftBackgroundWorker() {
 	r.mu.Lock()
-	electionTimeout := r.electionTimeout
+	electionTimeout := r.getElectionTimeout()
+	currentTerm := r.currentTerm
 	r.mu.Unlock()
 
-	electionTimeoutExpiryTimer := time.NewTimer(time.Duration(electionTimeout * int64(time.Millisecond)))
+	// periodically check if we need to start an election (and this will only happened if we are not a leader)
+	electionTimeoutExpiryTimer := time.NewTicker(time.Duration(5 * time.Microsecond))
+	defer electionTimeoutExpiryTimer.Stop()
 
 	for {
 		select {
 		case <-electionTimeoutExpiryTimer.C:
-			// should it be a go routine ?
-			go r.StartElection()
+			r.mu.Lock()
+			// if the term didn't get changed by any other go routine, we can still process this tick to check if we need to start an election.
+			// if we are a leader we shouldn't continue this background worker logic because no need to start an election if we are the leader of this term
+			if r.currentTerm != currentTerm || r.state == Candidate {
+				return
+			}
+
+			// if we didn't hear any election from any other candidate (RV) ? --> because RV handler resets the lastTimeElectionTimeoutGetReset timer
+			// if we didn't hear any heartbeat or new entry from the leader (AE) ? --> because AE handler resets the lastTimeElectionTimeoutGetReset timer
+			// so .. start an election
+			if time.Since(r.lastTimeElectionTimeoutGetReset) >= time.Duration(electionTimeout) {
+				r.StartElection()
+				r.mu.Unlock()
+				return
+			}
 		}
 	}
 
@@ -129,10 +161,11 @@ func (r *RaftNode) StartElection() {
 		r.mu.Unlock()
 		return
 	}
-
 	r.state = Candidate
 	r.currentTerm += 1
 	r.votedForNodeId = &r.NodeId
+	// reset my election timeout timer so the running election background go routine doesn't start another election while we are processing this election
+	r.lastTimeElectionTimeoutGetReset = time.Now()
 	calusterNodesNum := len(r.ClusterNodesIds)
 	termOfthisElection := r.currentTerm
 	RVArgs := &RequestVoteArgs{
@@ -141,20 +174,18 @@ func (r *RaftNode) StartElection() {
 		LastLogIndex: -1, // inital value
 		LastLogTerm:  -1, // initial value
 	}
-
 	// if we already have log entries, we can sned our last log index and term
 	if len(r.logs) > 0 {
 		RVArgs.LastLogIndex = r.logs[len(r.logs)-1].index
 		RVArgs.LastLogTerm = r.logs[len(r.logs)-1].term
 	}
-
 	r.mu.Unlock()
+
+	log.Printf("node_[%v]_is_now_candidate_and_will_start_election_for_term_[%v]\n", r.NodeId, termOfthisElection)
 
 	// I will use separate mutex for acessing the grantedVotes thread safely because for the ToLeader() ToFollower() ToCandidate() methods and other methods too will need to acuqire lock on the node mutex, so i don't want to stop other logic and cause a deadlock while i am locking on the grantedVote to do some checking
 	voteMutex := sync.Mutex{}
 	grantedVotes := 1 // voted for myself
-
-	wg := sync.WaitGroup{}
 
 	for peerId, peerAddress := range r.ClusterNodesIds {
 		r.mu.Lock()
@@ -163,19 +194,15 @@ func (r *RaftNode) StartElection() {
 		}
 		r.mu.Unlock()
 
-		wg.Add(1)
 		// because one of the go routines might cause state changing to follower or leader .. we must have a condition within every go routine to check if the state is still candidate to send the request
 		go func(peerId int, peerAddress string) {
-			// defer the ending of the wait group to avoid go routines leaking and the main routine (StartElection go routine will never ends and will keep waiting this leaked go routine)
-			defer wg.Done()
-
-			// TODO : should we acquire lock on the mutex or what ??
 			r.mu.Lock()
 			currentState := r.state
 			r.mu.Unlock()
 
+			// our state might get changed whilet these peers go routines are running so we have to handle this
 			if currentState != Candidate {
-				log.Printf("RV_for_term_[%v]: current_State_changed_to_[%v]\n", termOfthisElection, currentState)
+				log.Printf("RV_for_term_[%v]: current_State_changed_to_[%v]_cannot_continue_this_election\n", termOfthisElection, currentState)
 				return
 			}
 
@@ -210,8 +237,8 @@ func (r *RaftNode) StartElection() {
 		}(peerId, peerAddress)
 	}
 
-	wg.Wait()
-
+	// run the background go routine that checks periodically because when we started the election we returned from this background go routine
+	go r.RaftBackgroundWorker()
 }
 
 // Ensure Raft Consistency by only voting for candidate with most up to date log
@@ -239,6 +266,9 @@ func (r *RaftNode) ToFollower(term int64) {
 	r.votedForNodeId = nil
 	r.ResetElectionTimeout()
 	r.mu.Unlock()
+
+	// run the backgorund election checking
+	go r.RaftBackgroundWorker()
 }
 
 func (r *RaftNode) ToCandidate() {
@@ -257,15 +287,15 @@ func (r *RaftNode) ToLeader() {
 }
 
 func (r *RaftNode) SendHeartbeatToPeers() {
-	heartbeatTimer := time.NewTimer(time.Duration(r.heartbeatTimeout * int64(time.Millisecond))) // every 50 ms
-	heartbeatTimer.Stop()
+	heartbeatTimer := time.NewTicker(time.Duration(r.heartbeatTimeout * int64(time.Millisecond))) // every 50 ms
+	defer heartbeatTimer.Stop()
 
 	for {
 		select {
 		case <-heartbeatTimer.C:
 			r.mu.Lock()
 			if r.state != Leader {
-				log.Println("not_leader_to_send_heartbeat_request")
+				log.Printf("node_[%v]_is_not_leader_to_send_heartbeat_so_ending_this_heartbeat_worker\n", r.NodeId)
 				r.mu.Unlock()
 				return
 			}
@@ -322,7 +352,17 @@ func (r *RaftNode) SendHeartbeatToPeers() {
 					if AEReply.success {
 						log.Printf("AE_for_term_[%v]: peer_[%v]_replied_with_success\n", AEArgs.term, peerId)
 
-						// i set the len(AEArgs.entries) > 0 condition to check if we actually wanted to replicate our logs
+						// do we still leader and our term is same as the received term from this peer ?
+						r.mu.Lock()
+						if r.state != Leader || r.currentTerm != int64(AEReply.term) {
+							log.Printf("term_has_changed_or_state_has_changed_while_processing_sendHeartbeat_reply_from_peer_[%v]\n", peerId)
+							r.mu.Unlock()
+							return
+						}
+						r.mu.Unlock()
+
+						// ==> Update the nextIndex and matchIndex of this peer
+						// i set the len(AEArgs.entries) > 0 condition to check if we actually wanted to replicate our logs (if it wasn't an empty heartbeat without log rpelication)
 						if len(AEArgs.entries) > 0 {
 							// if leader log is [ [1:t1], [2:t2], [4:t2], [3:t3] ]
 							// if follower log is [ [1:t1], [2:t2] ]
@@ -348,11 +388,6 @@ func (r *RaftNode) SendHeartbeatToPeers() {
 					}
 				}(peerId, peerAddress)
 			}
-
-			// reset our heartbeat timer
-			r.mu.Lock()
-			heartbeatTimer.Reset(time.Duration(r.heartbeatTimeout * int64(time.Millisecond)))
-			r.mu.Unlock()
 		}
 	}
 }
@@ -426,11 +461,84 @@ func (r *RaftNode) CommitIndexWorker() {
 	}
 }
 
+// RULE : we only commit entry logs of our current term not a prev term that we weren't it's leader
+func (r *RaftNode) CommitIndexBusinessLogic() {
+
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return
+	}
+
+	// Get current log length
+	var lastLogIndex int64
+	if len(r.logs) > 0 {
+		lastLogIndex = int64(len(r.logs) - 1)
+	} else {
+		r.mu.Unlock()
+		return
+	}
+
+	oldCommitIndexBeforeCheckingMajority := r.commitIndex
+	// count replication status for each entry log after the current commit index
+	// why +1 ? because the initial state of the commit index is -1 so if we didn't commit anything yet we will start with the first entry at index 0 and if not = -1, so we always want to try to get majority of aggrement after the current committed index
+	for indexOfNewEntryToBeCommitted := int64(r.commitIndex + 1); indexOfNewEntryToBeCommitted <= lastLogIndex; indexOfNewEntryToBeCommitted++ {
+		replicationCount := 1 // count ourselves as a node aggreed on this commit index
+
+		// check how many followers have replicated this entry
+		for peerId := range r.ClusterNodesIds {
+			if peerId != r.NodeId {
+				// if we know a match index of this peer = or more than the index of the entry we are trying to get a majority for it, so we count this node as an aggreed one for this entry
+				if r.matchIndex[peerId] >= int64(indexOfNewEntryToBeCommitted) {
+					replicationCount++
+				}
+			}
+		}
+
+		// If majority have replicated and entry is from current term
+		if replicationCount >= (len(r.ClusterNodesIds)/2)+1 && r.logs[indexOfNewEntryToBeCommitted].term == int(r.currentTerm) {
+			oldCommitIndex := r.commitIndex
+			r.commitIndex = int64(indexOfNewEntryToBeCommitted)
+			log.Printf("Leader %d: Advanced commit index from %d to %d",
+				r.NodeId, oldCommitIndex, r.commitIndex)
+		}
+	}
+
+	if oldCommitIndexBeforeCheckingMajority != r.commitIndex {
+		r.commitIndexUpdatedChan <- struct{}{}
+	}
+	r.mu.Unlock()
+}
+
 func (r *RaftNode) applyCommittedEntriesToStateMachine(oldCommittedIndex, newCommittedIndex int64) {
 	// the last committed index is already applied so we start from old + 1
 	for i := oldCommittedIndex + 1; i <= newCommittedIndex; i++ {
 		command := r.logs[i].cmd
 		// TODO:  Apply command to your state machine
 		log.Printf("node_[%d]_applying_command_[%v]_at_index_[%d]", r.NodeId, command, i)
+	}
+}
+
+func (r *RaftNode) commitChanSender() {
+	for range r.commitIndexUpdatedChan {
+		// Find which entries we have to apply.
+		r.mu.Lock()
+		savedTerm := r.currentTerm
+		savedLastApplied := r.lastAppliedIndex
+		var entries []LogEntry
+		if r.commitIndex > r.lastAppliedIndex {
+			entries = r.logs[r.lastAppliedIndex+1 : r.commitIndex+1]
+			r.lastAppliedIndex = r.commitIndex
+		}
+		r.mu.Unlock()
+		log.Printf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			r.CommitChan <- LogEntry{
+				cmd:   entry.cmd,
+				index: int(savedLastApplied) + i + 1,
+				term:  int(savedTerm),
+			}
+		}
 	}
 }

@@ -50,11 +50,11 @@ type LogEntry struct {
 func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEntryReply) error {
 	r.mu.Lock()
 	currentTerm := r.currentTerm
-	currentState := r.state
+	// currentState := r.state
 	entryIndexAtPrevLogIndex, entryTermAtPrevLogIndex := -1, -1
 
 	// if me as follower have a log entry at the prevLogIndex && this logEntry at this index has term matches the PrevLogEntry .. so we match the leader logs at this point
-	if len(r.logs) >= args.prevLogIndex && args.prevLogIndex > 0 {
+	if len(r.logs) > args.prevLogIndex && args.prevLogIndex > 0 {
 		entryIndexAtPrevLogIndex = r.logs[args.prevLogIndex].index
 		entryTermAtPrevLogIndex = r.logs[args.prevLogIndex].term
 	}
@@ -62,48 +62,53 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 	nodeId := r.NodeId
 	r.mu.Unlock()
 
-	reply = &AppendEntryReply{
-		term:    int(r.currentTerm),
-		success: false,
-	}
-
-	if currentState == Leader {
-		return nil
-	}
-
 	// we should reject appendEntries rpc from previous terms
 	if currentTerm > int64(args.term) {
 		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_with_term_[%v]_less_than_current_term_[%v]\n", nodeId, args.leaderId, currentTerm, args.term)
 		return nil
 	}
 
-	// we should update our term and change our state to follower (in case we were a leader and received this appendEntires rpc with a higher term request)
+	// if currentState == Leader {
+	// 	return nil
+	// }
+
+	// we should update our term and change our state to follower (in case we were a leader/candidate and received this appendEntires rpc with a higher term request)
 	if currentTerm < int64(args.term) {
 		// reset our states required to represent a follower node
 		r.ToFollower(int64(args.term))
 	}
 
 	// NOW we have the same term we can negotiate if this leader is valid or not
+	r.mu.Lock()
+	reply.term = int(r.currentTerm)
+	reply.success = false
+	r.mu.Unlock()
 
 	// TODO : should we add this validation before any other vlaidaton on the AppendEntries logic and after validation on the term to separate between the heartbeat AE rpc and the regular AE rpc ?
 	if len(args.entries) == 0 {
 		log.Printf("received_heartbeat_appendEntries_rpc_from_leader_[%v]_at_term_[%v]\n", args.leaderId, args.term)
 		r.ToFollower(int64(args.term))
-		reply = &AppendEntryReply{
-			term:    int(args.term),
-			success: true,
-		}
+		reply.success = true
 		return nil
 	}
 
 	// the checking of log consistency after preparing the entryIndexAtPrevLogIndex and entryTermAtPrevLogTerm
 	if entryIndexAtPrevLogIndex == -1 {
 		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_but_has_no_log_entry_at_prevLogIndex_[%v]\n", nodeId, args.leaderId, args.prevLogIndex)
+
+		// TODO : Question -> is this right ????
+		// we don't have any entry at our log so we will put what we received from the leader
+		r.logs = args.entries
+		reply.success = true
+
 		return nil // the leader will decrement his knowledge of our preLogIndex and send it into the next AE rpc
 	}
 	// so we have log at this index, lets check its term
 	if entryTermAtPrevLogIndex != args.prevLogTerm {
 		log.Printf("node_[%v]_received_AppendEntries_rpc_from_leader_[%v]_has_log_entry_at_prevLogIndex_[%v]_but_has_term_[%v]_while_prevLogTerm_is_[%v]\n", nodeId, args.leaderId, args.prevLogIndex, entryTermAtPrevLogIndex, args.prevLogTerm)
+
+		r.ToFollower(int64(args.term))
+
 		return nil // the leader will decrement his knowledge of our preLogIndex and send it into the next AE rpc
 	}
 
@@ -120,23 +125,23 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 	if r.commitIndex < newCommittedIndex {
 		latestAppliedCommittedIndexToStateMachine := r.commitIndex
 		r.commitIndex = newCommittedIndex
+		r.commitIndexUpdatedChan <- struct{}{}
 		go r.applyCommittedEntriesToStateMachine(latestAppliedCommittedIndexToStateMachine, r.commitIndex)
 	}
 	r.mu.Unlock()
 
-	// this handler also should listen on a channel that the worker after processsing the request should return the reply into this channel here so this handler return the reply to the rpc caller
+	r.ResetElectionTimeout()
+	reply.success = true
+
 	return nil
 }
 
 func (r *RaftNode) RequestVoteHandler_RPC(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	r.mu.Lock()
 	currentTerm := r.currentTerm
+	reply.Term = int(r.currentTerm)
+	reply.VoteGranted = false
 	r.mu.Unlock()
-
-	reply = &RequestVoteReply{
-		Term:        int(currentTerm),
-		VoteGranted: false,
-	}
 
 	// if we have higher term just return because its an invalid RV request
 	if currentTerm > args.Term {
