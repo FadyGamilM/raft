@@ -2,8 +2,8 @@
 my implementation of the distributed consensus algorithm (Raft) in Go
 
 # How Raft works to support your replicated state machine design 
-![alt text](image-3.png)
-<!-- ![alt text](image.png) -->
+![alt text](image-4.png)
+
 # When to use Raft ?
 - Raft is not designed for highly throughput systems, because basically raft is a strong-leader algorithm.
 - use raft for `Replicating configs for a distributed system cluster` for example, but don't use it for a `database implementation`, because it will be really slow when the load increase`.
