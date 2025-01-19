@@ -116,34 +116,12 @@ func (r *RaftNode) RaftBackgroundWorker() {
 		case <-electionTimeoutExpiryTimer.C:
 			// should it be a go routine ?
 			go r.StartElection()
-
-		case <-r.receivedAppendEntryChan:
-			go r.HandleAppendEntry()
-
-		case <-r.receivedRequestVoteChan:
-			go r.HandleRequestVote()
 		}
 	}
 
 }
 
-/*
-When this function is used ?
-
-  - When the follower didn't receive a heartbeat (AppendEntries) rpc from the leader or a (RequestVote) from any candidate and the electionTimeout timer is expired
-
-Steps of Execution :
-
-  - Lock on node's state
-
-ResetElectionTimeout
-
-  - Increase the current term
-
-  - Vote for yourself
-
-  - Send RequestVote RPC to all nodes
-*/
+// When the follower didn't receive a heartbeat (AppendEntries) rpc from the leader or a (RequestVote) from any candidate and the electionTimeout timer is expired
 func (r *RaftNode) StartElection() {
 	r.mu.Lock()
 	if r.state == Leader {
@@ -253,10 +231,6 @@ func (r *RaftNode) isCandidateHasTheUpToDateLog(candidateLastLogIndex, candidate
 	// if my log is empty (length is zero), so if the candidate log have at least one entry, its up to date for me
 	return candidateLastLogIndex > 0
 }
-
-func (r *RaftNode) HandleAppendEntry() {}
-
-func (r *RaftNode) HandleRequestVote() {}
 
 func (r *RaftNode) ToFollower(term int64) {
 	r.mu.Lock()

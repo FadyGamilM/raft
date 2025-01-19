@@ -48,9 +48,6 @@ type LogEntry struct {
 
 // onyl append if we are at the same term
 func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEntryReply) error {
-	// TODO: i beleive we sohuld  deifne this channel as a chan of AE_Args not just struct
-	// r.receivedAppendEntryChan <- struct{}{}
-
 	r.mu.Lock()
 	currentTerm := r.currentTerm
 	currentState := r.state
@@ -132,9 +129,6 @@ func (r *RaftNode) AppendEntryHandler_RPC(args *AppendEntryArgs, reply *AppendEn
 }
 
 func (r *RaftNode) RequestVoteHandler_RPC(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	// TODO: i beleive we sohuld deifne this channel as a chan of RV_Args not just struct
-	// r.receivedRequestVoteChan <- struct{}{}
-
 	r.mu.Lock()
 	currentTerm := r.currentTerm
 	r.mu.Unlock()
