@@ -405,4 +405,49 @@ func (r *RaftNode) AppendNewEntry(command string) bool {
 	return true
 }
 
-// TODO  we must have a go routine that always checks the matchIndex of the majority of nodes and if we get a matchIndex for all majority of node on a specific index we just mark this index as committed into our (leader) log and maybe we should start sending COMMIT RPC containing the leader.CommitIndex to all other nodes for this entry
+// RULE : we only commit entry logs of our current term not a prev term that we weren't it's leader
+func (r *RaftNode) CommitIndexWorker() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+
+		r.mu.Lock()
+		if r.state != Leader {
+			r.mu.Unlock()
+			continue
+		}
+
+		// Get current log length
+		var lastLogIndex int64
+		if len(r.logs) > 0 {
+			lastLogIndex = int64(len(r.logs) - 1)
+		} else {
+			r.mu.Unlock()
+			continue
+		}
+
+		// count replication status for each entry log after the current commit index
+		// why +1 ? because the initial state of the commit index is -1 so if we didn't commit anything yet we will start with the first entry at index 0 and if not = -1, so we always want to try to get majority of aggrement after the current committed index
+		for indexOfNewEntryToBeCommitted := int64(r.commitIndex + 1); indexOfNewEntryToBeCommitted <= lastLogIndex; indexOfNewEntryToBeCommitted++ {
+			replicationCount := 1 // count ourselves as a node aggreed on this commit index
+
+			// check how many followers have replicated this entry
+			for peerId := range r.ClusterNodesIds {
+				if peerId != r.NodeId {
+					// if we know a match index of this peer = or more than the index of the entry we are trying to get a majority for it, so we count this node as an aggreed one for this entry
+					if r.matchIndex[peerId] >= int64(indexOfNewEntryToBeCommitted) {
+						replicationCount++
+					}
+				}
+			}
+
+			// If majority have replicated and entry is from current term
+			if replicationCount >= (len(r.ClusterNodesIds)/2)+1 && r.logs[indexOfNewEntryToBeCommitted].term == int(r.currentTerm) {
+				oldCommitIndex := r.commitIndex
+				r.commitIndex = int64(indexOfNewEntryToBeCommitted)
+				log.Printf("Leader %d: Advanced commit index from %d to %d",
+					r.NodeId, oldCommitIndex, r.commitIndex)
+			}
+		}
+		r.mu.Unlock()
+	}
+}
