@@ -519,9 +519,9 @@ func (r *RaftNode) applyCommittedEntriesToStateMachine(oldCommittedIndex, newCom
 	}
 }
 
-func (r *RaftNode) commitChanSender() {
+// the client that is connected to our raft pkg should listens on this chan to be notificd of the new entries
+func (r *RaftNode) clientCommitChan() {
 	for range r.commitIndexUpdatedChan {
-		// Find which entries we have to apply.
 		r.mu.Lock()
 		savedTerm := r.currentTerm
 		savedLastApplied := r.lastAppliedIndex
@@ -531,7 +531,6 @@ func (r *RaftNode) commitChanSender() {
 			r.lastAppliedIndex = r.commitIndex
 		}
 		r.mu.Unlock()
-		log.Printf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
 
 		for i, entry := range entries {
 			r.CommitChan <- LogEntry{
